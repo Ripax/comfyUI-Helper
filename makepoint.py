@@ -41,14 +41,77 @@ from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).resolve()
 
-# Expected location:
-# <ComfyUI>/makepoint.py
-COMFYUI_DIR = SCRIPT_PATH.parent
+# ComfyUI Desktop layout:
+#
+# ComfyUI-Installs/
+# └── ComfyUI/
+#     ├── standalone-env/
+#     └── ComfyUI/
+#         ├── custom_nodes/
+#         ├── models/
+#         ├── comfy/
+#         └── main.py
+#
+# makepoint.py is expected to be inside:
+#   ComfyUI-Installs/ComfyUI/
+#
+# Detect the actual ComfyUI source directory. Prefer COMFY_ROOT when it is
+# explicitly set so the script works when installed outside the repo root.
+
+env_comfy_root = os.environ.get("COMFY_ROOT")
+
+POSSIBLE_COMFYUI_DIRS = []
+
+if env_comfy_root:
+    comfy_root = Path(env_comfy_root).expanduser().resolve()
+    POSSIBLE_COMFYUI_DIRS.extend(
+        [
+            comfy_root,
+            comfy_root / "ComfyUI",
+        ]
+    )
+
+python_environment = Path(sys.executable).resolve().parent
+if python_environment.name.lower() == "standalone-env":
+    desktop_root = python_environment.parent
+    POSSIBLE_COMFYUI_DIRS.extend(
+        [
+            desktop_root,
+            desktop_root / "ComfyUI",
+        ]
+    )
+
+POSSIBLE_COMFYUI_DIRS.extend(
+    [
+        SCRIPT_PATH.parent / "ComfyUI",
+        SCRIPT_PATH.parent,
+    ]
+)
+
+COMFYUI_DIR = None
+
+for path in POSSIBLE_COMFYUI_DIRS:
+    if not path.exists():
+        continue
+
+    if (
+        (path / "custom_nodes").is_dir()
+        and (path / "main.py").exists()
+    ):
+        COMFYUI_DIR = path
+        break
+
+if COMFYUI_DIR is None:
+    if env_comfy_root:
+        COMFYUI_DIR = Path(env_comfy_root).expanduser().resolve()
+    elif (SCRIPT_PATH.parent / "ComfyUI").is_dir():
+        COMFYUI_DIR = SCRIPT_PATH.parent / "ComfyUI"
+    else:
+        COMFYUI_DIR = SCRIPT_PATH.parent
 
 CUSTOM_NODES_DIR = COMFYUI_DIR / "custom_nodes"
 
 DEFAULT_BACKUP_DIR = COMFYUI_DIR / "restore_points"
-
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -280,7 +343,7 @@ def scan_custom_nodes():
             continue
 
         # Ignore hidden folders
-        if node_dir.name.startswith("."):
+        if node_dir.name.startswith(".") or node_dir.name == "__pycache__":
             continue
 
         node = {
@@ -311,7 +374,7 @@ def scan_custom_nodes():
 
         nodes.append(node)
 
-    success(f"Found {len(nodes)} custom node repositories.")
+    success(f"Found {len(nodes)} custom nodes.")
 
     return nodes
 
@@ -920,6 +983,7 @@ def show_info():
                 "Python": get_python_info(),
                 "ComfyUI Version": get_comfyui_version(),
                 "Git": get_comfyui_git_info(),
+                "Custom Nodes Directory": str(CUSTOM_NODES_DIR),
                 "Custom Nodes": [
                     node["name"]
                     for node in scan_custom_nodes()
