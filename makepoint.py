@@ -1,5 +1,5 @@
-```python
 #!/usr/bin/env python3
+
 """
 ComfyUI Restore Point Manager
 =============================
@@ -948,22 +948,22 @@ def main():
         epilog="""
 Examples:
 
-  Create restore point:
+    Create restore point:
     python makepoint.py --backup
 
-  Create restore point in another directory:
+    Create restore point in another directory:
     python makepoint.py --backup --output D:\\ComfyBackups
 
-  Include model inventory:
+    Include model inventory:
     python makepoint.py --backup --models
 
-  Restore:
+    Restore:
     python makepoint.py --restore D:\\ComfyBackups\\ComfyUI_RestorePoint_20261114_120000
 
-  Restore only Python packages:
+    Restore only Python packages:
     python makepoint.py --restore D:\\Backup --nodes-only false
 
-  Show current installation:
+    Show current installation:
     python makepoint.py --info
         """,
     )
@@ -1048,4 +1048,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-```
