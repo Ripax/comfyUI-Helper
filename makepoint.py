@@ -17,6 +17,9 @@ Usage:
     Restore:
         python makepoint.py --restore "D:\\ComfyBackups\\ComfyUI_RestorePoint_20261114_120000"
 
+    Restore from a commit in Ripax/restore_points:
+        python makepoint.py --restore 0123456789abcdef0123456789abcdef01234567
+
     Restore without installing packages:
         python makepoint.py --restore "D:\\ComfyBackups\\..." --no-packages
 
@@ -32,6 +35,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -41,14 +45,77 @@ from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).resolve()
 
-# Expected location:
-# <ComfyUI>/makepoint.py
-COMFYUI_DIR = SCRIPT_PATH.parent
+# ComfyUI Desktop layout:
+#
+# ComfyUI-Installs/
+# └── ComfyUI/
+#     ├── standalone-env/
+#     └── ComfyUI/
+#         ├── custom_nodes/
+#         ├── models/
+#         ├── comfy/
+#         └── main.py
+#
+# makepoint.py is expected to be inside:
+#   ComfyUI-Installs/ComfyUI/
+#
+# Detect the actual ComfyUI source directory. Prefer COMFY_ROOT when it is
+# explicitly set so the script works when installed outside the repo root.
+
+env_comfy_root = os.environ.get("COMFY_ROOT")
+
+POSSIBLE_COMFYUI_DIRS = []
+
+if env_comfy_root:
+    comfy_root = Path(env_comfy_root).expanduser().resolve()
+    POSSIBLE_COMFYUI_DIRS.extend(
+        [
+            comfy_root,
+            comfy_root / "ComfyUI",
+        ]
+    )
+
+python_environment = Path(sys.executable).resolve().parent
+if python_environment.name.lower() == "standalone-env":
+    desktop_root = python_environment.parent
+    POSSIBLE_COMFYUI_DIRS.extend(
+        [
+            desktop_root,
+            desktop_root / "ComfyUI",
+        ]
+    )
+
+POSSIBLE_COMFYUI_DIRS.extend(
+    [
+        SCRIPT_PATH.parent / "ComfyUI",
+        SCRIPT_PATH.parent,
+    ]
+)
+
+COMFYUI_DIR = None
+
+for path in POSSIBLE_COMFYUI_DIRS:
+    if not path.exists():
+        continue
+
+    if (
+        (path / "custom_nodes").is_dir()
+        and (path / "main.py").exists()
+    ):
+        COMFYUI_DIR = path
+        break
+
+if COMFYUI_DIR is None:
+    if env_comfy_root:
+        COMFYUI_DIR = Path(env_comfy_root).expanduser().resolve()
+    elif (SCRIPT_PATH.parent / "ComfyUI").is_dir():
+        COMFYUI_DIR = SCRIPT_PATH.parent / "ComfyUI"
+    else:
+        COMFYUI_DIR = SCRIPT_PATH.parent
 
 CUSTOM_NODES_DIR = COMFYUI_DIR / "custom_nodes"
 
 DEFAULT_BACKUP_DIR = COMFYUI_DIR / "restore_points"
-
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -280,7 +347,7 @@ def scan_custom_nodes():
             continue
 
         # Ignore hidden folders
-        if node_dir.name.startswith("."):
+        if node_dir.name.startswith(".") or node_dir.name == "__pycache__":
             continue
 
         node = {
@@ -311,7 +378,7 @@ def scan_custom_nodes():
 
         nodes.append(node)
 
-    success(f"Found {len(nodes)} custom node repositories.")
+    success(f"Found {len(nodes)} custom nodes.")
 
     return nodes
 
@@ -549,6 +616,346 @@ def create_backup(output_dir=None, include_models=False):
     )
 
     return backup_dir
+
+
+def push_backup_to_github(backup_dir, dry_run=False):
+    repository_url = "https://github.com/Ripax/restore_points.git"
+
+    if dry_run:
+        log("Checking the GitHub push without publishing the restore point...")
+    else:
+        log("Pushing restore point to the public GitHub repository...")
+
+    with tempfile.TemporaryDirectory(prefix="makepoint-github-") as temp_dir:
+        repository_dir = Path(temp_dir) / "restore_points"
+        code, output = run_command(
+            [
+                "git",
+                "clone",
+                "--branch",
+                "main",
+                repository_url,
+                str(repository_dir),
+            ]
+        )
+
+        if code != 0:
+            error("Could not clone the restore point repository.")
+            print(output)
+            return False
+
+        destination = repository_dir / backup_dir.name
+        if destination.exists():
+            error(f"A restore point named {backup_dir.name} already exists on GitHub.")
+            return False
+
+        shutil.copytree(backup_dir, destination)
+
+        code, output = git_command(["add", "--", backup_dir.name], repository_dir)
+        if code != 0:
+            error("Could not stage the restore point.")
+            print(output)
+            return False
+
+        code, output = git_command(
+            ["commit", "-m", f"Add restore point {backup_dir.name}"],
+            repository_dir,
+        )
+        if code != 0:
+            error("Could not commit the restore point. Check your Git identity configuration.")
+            print(output)
+            return False
+
+        push_args = ["push", "origin", "main"]
+        if dry_run:
+            push_args.insert(1, "--dry-run")
+
+        code, output = git_command(push_args, repository_dir)
+        if code != 0:
+            if dry_run:
+                error("GitHub push dry run failed. Check your GitHub credentials and access.")
+            else:
+                error("Could not push the restore point. Check your GitHub credentials and access.")
+            print(output)
+            return False
+
+    if dry_run:
+        success(f"GitHub push dry run passed; nothing was published to {repository_url}.")
+    else:
+        success(f"Restore point pushed to {repository_url}.")
+    return True
+
+
+def is_commit_id(value):
+    return (
+        4 <= len(value) <= 40
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
+
+
+def print_restore_points_tui(title, headers, rows, empty_message):
+    display_rows = rows or [[empty_message] + [""] * (len(headers) - 1)]
+    widths = [
+        max(
+            len(header),
+            *(len(row[index]) for row in display_rows),
+        )
+        for index, header in enumerate(headers)
+    ]
+    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    content_width = sum(widths) + 3 * len(widths) - 1
+
+    print()
+    print(border)
+    print(f"| {title.center(content_width - 2)} |")
+    print(border)
+    print("| " + " | ".join(
+        header.ljust(width)
+        for header, width in zip(headers, widths)
+    ) + " |")
+    print(border)
+
+    for row in display_rows:
+        print("| " + " | ".join(
+            value.ljust(width)
+            for value, width in zip(row, widths)
+        ) + " |")
+
+    print(border)
+
+
+def list_local_restore_points():
+    if not DEFAULT_BACKUP_DIR.is_dir():
+        print_restore_points_tui(
+            "LOCAL RESTORE POINTS",
+            ["DATE", "BACKUP", "RESTORE PATH"],
+            [],
+            "No local restore points found",
+        )
+        return True
+
+    try:
+        backup_dirs = [
+            path
+            for path in DEFAULT_BACKUP_DIR.iterdir()
+            if path.is_dir() and (path / "restore_point.json").is_file()
+        ]
+    except OSError as exc:
+        error(f"Could not list local restore points: {exc}")
+        return False
+
+    restore_points = []
+    for backup_dir in backup_dirs:
+        manifest_file = backup_dir / "restore_point.json"
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            warning(f"Skipping invalid local restore point {backup_dir}: {exc}")
+            continue
+
+        if not isinstance(manifest, dict):
+            warning(f"Skipping invalid local restore point manifest: {manifest_file}")
+            continue
+
+        created = manifest.get("created", "unknown")
+        restore_points.append(
+            {
+                "created": str(created) if created else "unknown",
+                "path": backup_dir,
+            }
+        )
+
+    restore_points.sort(
+        key=lambda item: (item["created"] != "unknown", item["created"]),
+        reverse=True,
+    )
+
+    print_restore_points_tui(
+        f"LOCAL RESTORE POINTS ({len(restore_points)})",
+        ["DATE", "BACKUP", "RESTORE PATH"],
+        [
+            [
+                restore_point["created"],
+                restore_point["path"].name,
+                str(restore_point["path"]),
+            ]
+            for restore_point in restore_points
+        ],
+        "No local restore points found",
+    )
+
+    return True
+
+
+def list_github_restore_points():
+    repository_url = "https://github.com/Ripax/restore_points.git"
+
+    with tempfile.TemporaryDirectory(prefix="makepoint-list-") as temp_dir:
+        repository_dir = Path(temp_dir) / "restore_points"
+        code, output = run_command(
+            [
+                "git",
+                "clone",
+                "--branch",
+                "main",
+                repository_url,
+                str(repository_dir),
+            ]
+        )
+        if code != 0:
+            error("Could not clone the restore point repository.")
+            print(output)
+            return False
+
+        code, output = git_command(
+            ["ls-tree", "--name-only", "-d", "HEAD"],
+            repository_dir,
+        )
+        if code != 0:
+            error("Could not list restore points in the GitHub repository.")
+            print(output)
+            return False
+
+        restore_points = []
+        for directory_name in output.splitlines():
+            manifest_file = repository_dir / directory_name / "restore_point.json"
+            if not manifest_file.is_file():
+                continue
+
+            try:
+                manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                error(f"Could not read {manifest_file}: {exc}")
+                return False
+
+            code, commit_id = git_command(
+                [
+                    "log",
+                    "-1",
+                    "--format=%H",
+                    "--diff-filter=A",
+                    "HEAD",
+                    "--",
+                    f"{directory_name}/restore_point.json",
+                ],
+                repository_dir,
+            )
+            if code != 0 or not commit_id:
+                error(f"Could not find the commit for {directory_name}.")
+                print(commit_id)
+                return False
+
+            restore_points.append(
+                {
+                    "created": manifest.get("created", "unknown"),
+                    "name": directory_name,
+                    "commit": commit_id,
+                }
+            )
+
+        restore_points.sort(
+            key=lambda item: item["created"],
+            reverse=True,
+        )
+
+        print_restore_points_tui(
+            f"GITHUB RESTORE POINTS ({len(restore_points)})",
+            ["DATE", "BACKUP", "COMMIT ID"],
+            [
+                [
+                    str(restore_point["created"]),
+                    restore_point["name"],
+                    restore_point["commit"],
+                ]
+                for restore_point in restore_points
+            ],
+            "No GitHub restore points found",
+        )
+
+    print("Restore a GitHub backup with: python makepoint.py --restore <COMMIT_ID>")
+
+    return True
+
+
+def download_github_restore_point(commit_id, destination_dir):
+    repository_url = "https://github.com/Ripax/restore_points.git"
+    repository_dir = Path(destination_dir) / "restore_points"
+
+    log(f"Downloading restore point for commit {commit_id}...")
+
+    code, output = run_command(
+        [
+            "git",
+            "clone",
+            "--branch",
+            "main",
+            repository_url,
+            str(repository_dir),
+        ]
+    )
+    if code != 0:
+        error("Could not clone the restore point repository.")
+        print(output)
+        return None
+
+    code, resolved_commit = git_command(
+        ["rev-parse", "--verify", f"{commit_id}^{{commit}}"],
+        repository_dir,
+    )
+    if code != 0:
+        error(f"Commit {commit_id} was not found in the restore point repository.")
+        print(resolved_commit)
+        return None
+
+    code, output = git_command(
+        [
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            resolved_commit,
+        ],
+        repository_dir,
+    )
+    if code != 0:
+        error(f"Could not inspect commit {resolved_commit}.")
+        print(output)
+        return None
+
+    backup_dirs = {
+        Path(*changed_file.split("/")).parent
+        for changed_file in output.splitlines()
+        if changed_file.endswith("/restore_point.json")
+    }
+
+    if not backup_dirs:
+        error(f"Commit {resolved_commit} does not contain a restore point.")
+        return None
+
+    if len(backup_dirs) != 1:
+        error(
+            f"Commit {resolved_commit} contains multiple restore points; "
+            "use a commit that adds exactly one."
+        )
+        return None
+
+    code, output = git_command(
+        ["checkout", "--detach", resolved_commit],
+        repository_dir,
+    )
+    if code != 0:
+        error(f"Could not check out commit {resolved_commit}.")
+        print(output)
+        return None
+
+    backup_path = repository_dir / next(iter(backup_dirs))
+    if not (backup_path / "restore_point.json").is_file():
+        error(f"Restore point manifest is missing from commit {resolved_commit}.")
+        return None
+
+    success(f"Downloaded restore point: {backup_path.name}")
+    return backup_path
 
 
 # ----------------------------------------------------------------------
@@ -920,6 +1327,7 @@ def show_info():
                 "Python": get_python_info(),
                 "ComfyUI Version": get_comfyui_version(),
                 "Git": get_comfyui_git_info(),
+                "Custom Nodes Directory": str(CUSTOM_NODES_DIR),
                 "Custom Nodes": [
                     node["name"]
                     for node in scan_custom_nodes()
@@ -951,6 +1359,15 @@ Examples:
     Create restore point:
     python makepoint.py --backup
 
+    Create and push a restore point to the public GitHub repository:
+    python makepoint.py --backup --github
+
+    Test backup creation without keeping files:
+    python makepoint.py --backup --dry-run
+
+    Test backup creation and GitHub push access without publishing:
+    python makepoint.py --backup --github --dry-run
+
     Create restore point in another directory:
     python makepoint.py --backup --output D:\\ComfyBackups
 
@@ -959,6 +1376,12 @@ Examples:
 
     Restore:
     python makepoint.py --restore D:\\ComfyBackups\\ComfyUI_RestorePoint_20261114_120000
+
+    Restore from a GitHub restore-point commit:
+    python makepoint.py --restore 0123456789abcdef0123456789abcdef01234567
+
+    List local and GitHub restore points:
+    python makepoint.py --restore list
 
     Restore only Python packages:
     python makepoint.py --restore D:\\Backup --nodes-only false
@@ -975,9 +1398,30 @@ Examples:
     )
 
     parser.add_argument(
+        "--github",
+        action="store_true",
+        help=(
+            "Push the new restore point to the public "
+            "Ripax/restore_points GitHub repository."
+        ),
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run backup checks in a temporary directory, then remove it. "
+            "With --github, also test the push without publishing."
+        ),
+    )
+
+    parser.add_argument(
         "--restore",
-        metavar="PATH",
-        help="Restore from a restore point.",
+        metavar="PATH_OR_COMMIT",
+        help=(
+            "Restore from a local path or GitHub commit, or use 'list' "
+            "to list local and GitHub restore points."
+        ),
     )
 
     parser.add_argument(
@@ -1018,23 +1462,63 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.github and not args.backup:
+        parser.error("--github can only be used with --backup.")
+
     if args.backup:
 
-        create_backup(
+        if args.dry_run:
+            if args.output:
+                parser.error("--output cannot be used with --dry-run.")
+
+            with tempfile.TemporaryDirectory(prefix="makepoint-dry-run-") as temp_dir:
+                backup_dir = create_backup(
+                    output_dir=temp_dir,
+                    include_models=args.models,
+                )
+
+                if args.github and not push_backup_to_github(
+                    backup_dir,
+                    dry_run=True,
+                ):
+                    return 1
+
+            success("Dry run completed; temporary backup files were removed.")
+            return
+
+        backup_dir = create_backup(
             output_dir=args.output,
             include_models=args.models,
         )
+
+        if args.github and not push_backup_to_github(backup_dir):
+            return 1
 
         return
 
     if args.restore:
 
-        restore_backup(
-            args.restore,
-            restore_packages_enabled=not args.no_packages,
-            restore_nodes_enabled=not args.no_nodes,
-            restore_comfyui_enabled=not args.no_comfyui,
-        )
+        if args.restore.lower() == "list":
+            local_success = list_local_restore_points()
+            github_success = list_github_restore_points()
+            return 0 if local_success and github_success else 1
+
+        restore_options = {
+            "restore_packages_enabled": not args.no_packages,
+            "restore_nodes_enabled": not args.no_nodes,
+            "restore_comfyui_enabled": not args.no_comfyui,
+        }
+
+        restore_path = Path(args.restore)
+        if restore_path.exists() or not is_commit_id(args.restore):
+            restore_backup(args.restore, **restore_options)
+        else:
+            with tempfile.TemporaryDirectory(prefix="makepoint-restore-") as temp_dir:
+                backup_path = download_github_restore_point(args.restore, temp_dir)
+                if backup_path is None:
+                    return 1
+
+                restore_backup(backup_path, **restore_options)
 
         return
 
@@ -1047,4 +1531,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
